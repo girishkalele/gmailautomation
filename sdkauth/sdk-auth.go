@@ -98,9 +98,8 @@ func saveToken(file string, token *oauth2.Token) {
  * SDK Example Authentication token code ends here.
  */
 
-// Return a pool of Gmail clients created off the same OAuth2 http client
+// Return a pool of Gmail clients
 func GetGmailClients(poolSize int) (clients []*gmail.Service) {
-	ctx := context.Background()
 	usr, err := user.Current()
 	if err != nil {
 		return clients
@@ -118,7 +117,7 @@ func GetGmailClients(poolSize int) (clients []*gmail.Service) {
 	}
 
 	for i := 0; i < poolSize; i++ {
-		srv, err := gmail.New(GetClient(ctx, config))
+		srv, err := gmail.New(GetClient(context.Background(), config))
 		if err != nil {
 			log.Fatalf("Unable to retrieve gmail Client %v", err)
 		}

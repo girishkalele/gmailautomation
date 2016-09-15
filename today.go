@@ -13,13 +13,18 @@ import (
 
 var labelNameToId map[string]string
 var labelIdToName map[string]string
+var excludedLabels []string
+var includedLabels []string
 
 var lookupFailures int
 var modifyFailures int
+var modifyLabels int
 
 func init() {
 	labelNameToId = make(map[string]string)
 	labelIdToName = make(map[string]string)
+	excludedLabels = []string{"A/K8-bugs", "A/Issues", "Vaguely-Interested-Lists"}
+	includedLabels = []string{"0/Me"}
 }
 
 const (
@@ -56,34 +61,48 @@ func prettyLabels(labels []string) []string {
 func findItemsWithQueryAndDispatch(clientPool chan *gmail.Service, query string, callbackFn func(chan *gmail.Service, string, chan bool)) error {
 	srv := <-clientPool
 	defer func() { clientPool <- srv }()
-	messages, err := srv.Users.Messages.List("me").Q(query).MaxResults(10000).Do()
+	messages, err := srv.Users.Messages.List("me").Q(query).MaxResults(1000).Do()
 	if err != nil {
 		return err
 	}
-	log.Printf("Query '%s' returned %d results", query, len(messages.Messages))
-	if len(messages.Messages) == 0 {
-		return nil
+	log.Printf("Query '%s' returned %d results (estimated total %d)", query, len(messages.Messages), messages.ResultSizeEstimate)
+	var nextPageToken string
+	ids := []string{}
+	for {
+		if len(messages.Messages) == 0 {
+			break
+		}
+		for _, m := range messages.Messages {
+			ids = append(ids, m.Id)
+		}
+		if len(messages.NextPageToken) == 0 { //|| (nextPageToken == messages.NextPageToken) {
+			log.Println("No more pages")
+			break
+		}
+		nextPageToken = messages.NextPageToken
+		messages = &gmail.ListMessagesResponse{}
+		if messages, err = srv.Users.Messages.List("me").Q(query).PageToken(nextPageToken).MaxResults(1000).Do(); err != nil {
+			return err
+		}
+		log.Printf("Next Page token %s returned %d results (estimated total %d)", nextPageToken, len(messages.Messages), messages.ResultSizeEstimate)
 	}
-	inflight := 0
 	completionChannel := make(chan bool, 1024)
-	for _, m := range messages.Messages {
-		go callbackFn(clientPool, m.Id, completionChannel)
+	inflight := 0
+	for _, id := range ids {
+		go callbackFn(clientPool, id, completionChannel)
 		inflight++
 	}
-	log.Printf("Dispatched %d goroutines to handle these results asynchronously", inflight)
+	log.Printf("Dispatched %d goroutines to handle all results asynchronously", inflight)
 	// Let all the messages process asynchronously but this function returns only after all goroutines have finished
 	for i := 0; i < inflight; i++ {
 		<-completionChannel
 	}
-	log.Printf("All goroutines finished")
 	return nil
 }
 
 // Format time.Time into a Gmail Query friendly date
 func formatGmailDate(t time.Time) string {
-	d := fmt.Sprintf("%d/%d/%d", t.Year(), t.Month(), t.Day())
-	log.Printf("%v transformed to %s", t, d)
-	return d
+	return fmt.Sprintf("%d/%d/%d", t.Year(), t.Month(), t.Day())
 }
 
 func cleanupOldThreads(clientPool chan *gmail.Service, threadLatestTimestamps map[string]int64, threshold int64) {
@@ -96,6 +115,7 @@ func cleanupOldThreads(clientPool chan *gmail.Service, threadLatestTimestamps ma
 				srv := <-clientPool
 				defer func() { clientPool <- srv }()
 				defer func() { completionChannel <- true }()
+				modifyLabels++
 				// The latest message in this message thread is older than yesterday, remove the label
 				_, err := srv.Users.Threads.Modify("me", threadId,
 					&gmail.ModifyThreadRequest{RemoveLabelIds: []string{todayLabelId}}).Do()
@@ -174,8 +194,29 @@ func doOperations(clients []*gmail.Service) {
 			if sliceContainsString(prettyLabels, TodayLabel) || mfull.InternalDate < (yesterday.Unix()*1000) {
 				return
 			}
+			exclude := false
+			// If the thread has atleast one label on the excludedLabels list, we skip it (except for the override below)
+			for _, label := range excludedLabels {
+				if sliceContainsString(prettyLabels, label) {
+					exclude = true
+					break
+				}
+			}
+			// If the thread has atleast one label in the includedLabels list, we must mark label=Today
+			if exclude {
+				for _, label := range includedLabels {
+					if sliceContainsString(prettyLabels, label) {
+						exclude = false
+						break
+					}
+				}
+			}
+			if exclude {
+				return
+			}
 			// Need to attach the Today label
-			fmt.Println("Need to attach the Today label to", mfull.Id, mfull.Snippet)
+			//fmt.Println("Need to attach the Today label to", mfull.Id, mfull.Snippet)
+			modifyLabels++
 			_, err = srv.Users.Threads.Modify("me", mfull.ThreadId,
 				&gmail.ModifyThreadRequest{AddLabelIds: []string{todayLabelId}}).Do()
 			if err != nil {
@@ -210,12 +251,20 @@ func buildLabelTranslationTable(clients []*gmail.Service, verbose bool) {
 	}
 }
 
+func printStats() {
+	log.Printf("Statistics from run")
+	log.Printf("modifyFailures: %d", modifyFailures)
+	log.Printf("lookupFailures: %d", lookupFailures)
+	log.Printf("modifyLabels: %d", modifyLabels)
+}
+
 /*
 * Original example main
  */
 func main() {
-	// Build a pool of gmail.Clients for parallel use, these share the same http.Client + OAuth2 client
+	// Build a pool of gmail.Clients for parallel use
 	clients := sdkauth.GetGmailClients(8)
-	buildLabelTranslationTable(clients, true)
+	buildLabelTranslationTable(clients, false)
 	doOperations(clients)
+	printStats()
 }
